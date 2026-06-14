@@ -5,7 +5,7 @@ use crate::net::connection::Connection;
 use crate::protocol::constants::*;
 use crate::protocol::parser::{Parser, ParseEvent, EventType};
 use crate::protocol::subneg::Subneg;
-use crate::terminal::terminal::DisplayMode;
+use crate::terminal::terminal::{DisplayMode, WindowSize};
 
 pub struct SessionConfig {
     pub hostname: String,
@@ -37,6 +37,7 @@ pub struct Session {
     subneg: Subneg,
     prompt_detector: PromptDetector,
     display_mode: DisplayMode,
+    window_size: WindowSize,
     active: bool,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
     event_rx: Option<mpsc::UnboundedReceiver<SessionEvent>>,
@@ -52,6 +53,7 @@ impl Session {
             subneg: Subneg::new(),
             prompt_detector: PromptDetector::new(),
             display_mode: DisplayMode::Raw,
+            window_size: WindowSize { width: 80, height: 24 },
             active: false,
             event_tx,
             event_rx: Some(event_rx),
@@ -97,6 +99,10 @@ impl Session {
         self.subneg.set_auth_request_callback(move |_types: Vec<u8>| {
             let _ = event_tx.send(SessionEvent::SendData(vec![IAC, WONT, TELOPT_AUTHENTICATION]));
         });
+
+        // Set up window_size_getter for subneg NAWS
+        let ws = self.window_size;
+        self.subneg.set_window_size_getter(move || ws);
 
         // Set up parser callback - processes IAC sequences, emits clean data
         let event_tx = self.event_tx.clone();
@@ -267,12 +273,26 @@ impl Session {
         self.active
     }
 
+    pub fn set_window_size(&mut self, size: WindowSize) {
+        self.window_size = size;
+    }
+
     pub fn notify_resize(&self) {
         if !self.active {
             return;
         }
-        self.subneg.send_naws();
-        log::debug!("Session notify_resize: sent NAWS");
+        // Build and send NAWS directly with current window size
+        let ws = self.window_size;
+        let naws_data: Vec<u8> = vec![
+            IAC, SB, TELOPT_NAWS,
+            (ws.width >> 8) as u8,
+            (ws.width & 0xFF) as u8,
+            (ws.height >> 8) as u8,
+            (ws.height & 0xFF) as u8,
+            IAC, SE,
+        ];
+        let _ = self.event_tx.send(SessionEvent::SendData(naws_data));
+        log::debug!("Session notify_resize: sent NAWS {}x{}", ws.width, ws.height);
     }
 
     pub fn display_mode(&self) -> DisplayMode {

@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use crate::auth::prompt_detector::PromptDetector;
 use crate::net::connection::Connection;
 use crate::protocol::rlogin::{RloginConfig, RloginParser};
-use crate::terminal::terminal::DisplayMode;
+use crate::terminal::terminal::{DisplayMode, WindowSize};
 
 pub struct RloginSessionConfig {
     pub hostname: String,
@@ -31,6 +31,7 @@ pub struct RloginSession {
     parser: RloginParser,
     prompt_detector: PromptDetector,
     display_mode: DisplayMode,
+    window_size: WindowSize,
     active: bool,
     event_tx: mpsc::UnboundedSender<RloginSessionEvent>,
     event_rx: Option<mpsc::UnboundedReceiver<RloginSessionEvent>>,
@@ -44,6 +45,7 @@ impl RloginSession {
             parser: RloginParser::new(),
             prompt_detector: PromptDetector::new(),
             display_mode: DisplayMode::Raw,
+            window_size: WindowSize { width: 80, height: 24 },
             active: false,
             event_tx,
             event_rx: Some(event_rx),
@@ -154,6 +156,10 @@ impl RloginSession {
         self.display_mode
     }
 
+    pub fn set_window_size(&mut self, size: WindowSize) {
+        self.window_size = size;
+    }
+
     pub fn handle_event(&mut self, event: RloginSessionEvent) {
         match event {
             RloginSessionEvent::ServerData(data) => {
@@ -167,14 +173,14 @@ impl RloginSession {
                 }
             }
             RloginSessionEvent::WindowResize => {
-                // Use default 80x24 for resize notification
-                let resize_data = RloginParser::build_window_resize(24, 80);
+                let ws = self.window_size;
+                let resize_data = RloginParser::build_window_resize(ws.height, ws.width);
                 if let Some(conn) = self.connection.clone() {
                     tokio::spawn(async move {
                         conn.send(&resize_data).await;
                     });
                 }
-                log::debug!("Rlogin window resize sent");
+                log::debug!("Rlogin window resize sent: {}x{}", ws.width, ws.height);
             }
             RloginSessionEvent::Close(reason) => {
                 self.stop(&reason);
