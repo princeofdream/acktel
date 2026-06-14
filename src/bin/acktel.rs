@@ -62,8 +62,15 @@ fn main() {
     let passwd_prompts = args.passwd_prompt.clone();
     let timeout = args.timeout;
 
-    // Enable crossterm raw mode for proper key event detection
-    crossterm::terminal::enable_raw_mode().expect("Failed to enable raw mode");
+    // Enable raw mode for proper key event detection on Windows
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, we use Console API directly - no crossterm raw mode needed
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        crossterm::terminal::enable_raw_mode().expect("Failed to enable raw mode");
+    }
 
     let mut shutdown = ShutdownManager::new();
     shutdown.install_signal_handlers();
@@ -99,7 +106,10 @@ fn main() {
     }
 
     // Restore terminal
-    let _ = crossterm::terminal::disable_raw_mode();
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
     println!("\r\nDisconnected");
 }
 
@@ -148,10 +158,10 @@ fn run_telnet(
         let event_sender = session.event_sender();
         let mut event_rx = session.take_event_receiver().unwrap();
 
-        // Spawn stdin reader using crossterm
+        // Spawn stdin reader using platform-specific API
         let stdin_event_tx = event_sender.clone();
         std::thread::spawn(move || {
-            read_stdin_crossterm(stdin_event_tx);
+            read_stdin_platform(stdin_event_tx);
         });
 
         // Main event loop
@@ -170,6 +180,70 @@ fn run_telnet(
             }
         }
     });
+}
+
+/// Read stdin - cross-platform
+fn read_stdin_platform(event_tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::Read;
+        log::debug!("stdin thread started (Windows)");
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        let mut buf = [0u8; 256];
+
+        loop {
+            match handle.read(&mut buf) {
+                Ok(0) => {
+                    log::debug!("stdin EOF");
+                    break;
+                }
+                Ok(n) => {
+                    let data = buf[..n].to_vec();
+                    log::debug!("stdin read {} bytes: {:?}", n, &data[..n.min(8)]);
+
+                    if data.len() >= 2 && data[0] == b'~' && data[1] == b'.' {
+                        let _ = event_tx.send(SessionEvent::Close("disconnect".to_string()));
+                        return;
+                    }
+
+                    let _ = event_tx.send(SessionEvent::SendData(data));
+                }
+                Err(e) => {
+                    log::error!("stdin read error: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::io::Read;
+        log::debug!("stdin thread started (Unix)");
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        let mut buf = [0u8; 256];
+
+        loop {
+            match handle.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let data = buf[..n].to_vec();
+                    if data.len() >= 2 && data[0] == b'~' && data[1] == b'.' {
+                        let _ = event_tx.send(SessionEvent::Close("disconnect".to_string()));
+                        return;
+                    }
+                    let _ = event_tx.send(SessionEvent::SendData(data));
+                }
+                Err(e) => {
+                    log::error!("stdin read error: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = event_tx.send(SessionEvent::Close("stdin ended".to_string()));
 }
 
 fn run_rlogin(
@@ -228,7 +302,7 @@ fn run_rlogin(
         // Spawn stdin reader using crossterm
         let stdin_event_tx = event_sender.clone();
         std::thread::spawn(move || {
-            read_stdin_crossterm_rlogin(stdin_event_tx);
+            read_stdin_rlogin(stdin_event_tx);
         });
 
         // Main event loop
@@ -249,161 +323,71 @@ fn run_rlogin(
     });
 }
 
-fn read_stdin_crossterm(event_tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>) {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-    use std::time::Duration;
+fn read_stdin_rlogin(event_tx: tokio::sync::mpsc::UnboundedSender<RloginSessionEvent>) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::System::Console::*;
 
-    loop {
-        if !event::poll(Duration::from_millis(100)).unwrap_or(false) {
-            continue;
-        }
-
-        match event::read() {
-            Ok(Event::Key(key_event)) if key_event.kind == KeyEventKind::Press => {
-                let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
-                let alt = key_event.modifiers.contains(KeyModifiers::ALT);
-
-                // Alt+. → disconnect
-                if alt && key_event.code == KeyCode::Char('.') {
-                    let _ = event_tx.send(SessionEvent::Close(
-                        "User requested disconnect".to_string(),
-                    ));
-                    return;
+        unsafe {
+            let h_stdin = GetStdHandle(STD_INPUT_HANDLE).unwrap_or_default();
+            loop {
+                let mut ir: [INPUT_RECORD; 128] = std::mem::zeroed();
+                let mut count = 0u32;
+                if ReadConsoleInputW(h_stdin, &mut ir, &mut count).is_err() {
+                    break;
                 }
+                for i in 0..count as usize {
+                    let record = &ir[i];
+                    if record.EventType != 1 { continue; }
+                    let ke = &record.Event.KeyEvent;
+                    if !ke.bKeyDown.as_bool() { continue; }
+                    let dw = ke.dwControlKeyState;
+                    let alt = (dw & 0x0002) != 0 || (dw & 0x0001) != 0;
+                    let ctrl = (dw & 0x0008) != 0 || (dw & 0x0004) != 0;
+                    let ch = ke.uChar.UnicodeChar;
+                    let vkey = ke.wVirtualKeyCode;
 
-                // Window resize events are not handled via crossterm in this simple version
-                // TODO: Add crossterm resize event handling
-
-                if ctrl {
-                    if let KeyCode::Char(c) = key_event.code {
-                        let data = vec![(c as u8) & 0x1F];
-                        let _ = event_tx.send(SessionEvent::SendData(data));
-                        continue;
+                    if alt && ch == '.' as u16 {
+                        let _ = event_tx.send(RloginSessionEvent::Close("disconnect".to_string()));
+                        return;
                     }
-                }
-
-                if alt {
-                    if let KeyCode::Char(c) = key_event.code {
-                        let data = vec![0x1b, c as u8];
-                        let _ = event_tx.send(SessionEvent::SendData(data));
-                        continue;
-                    }
-                }
-
-                match key_event.code {
-                    KeyCode::Char(c) => {
-                        let data = vec![c as u8];
-                        let _ = event_tx.send(SessionEvent::SendData(data));
-                    }
-                    KeyCode::Enter => {
-                        let _ = event_tx.send(SessionEvent::SendData(vec![b'\r']));
-                    }
-                    KeyCode::Backspace => {
-                        let _ = event_tx.send(SessionEvent::SendData(vec![0x7f]));
-                    }
-                    KeyCode::Tab => {
-                        let _ = event_tx.send(SessionEvent::SendData(vec![b'\t']));
-                    }
-                    KeyCode::Esc => {
-                        let _ = event_tx.send(SessionEvent::SendData(vec![0x1b]));
-                    }
-                    KeyCode::Up => {
-                        let _ = event_tx.send(SessionEvent::SendData(b"\x1b[A".to_vec()));
-                    }
-                    KeyCode::Down => {
-                        let _ = event_tx.send(SessionEvent::SendData(b"\x1b[B".to_vec()));
-                    }
-                    KeyCode::Right => {
-                        let _ = event_tx.send(SessionEvent::SendData(b"\x1b[C".to_vec()));
-                    }
-                    KeyCode::Left => {
-                        let _ = event_tx.send(SessionEvent::SendData(b"\x1b[D".to_vec()));
-                    }
-                    KeyCode::Home => {
-                        let _ = event_tx.send(SessionEvent::SendData(b"\x1b[H".to_vec()));
-                    }
-                    KeyCode::End => {
-                        let _ = event_tx.send(SessionEvent::SendData(b"\x1b[F".to_vec()));
-                    }
-                    KeyCode::Null => {
-                        let _ = event_tx.send(SessionEvent::SendData(vec![0x00]));
-                    }
-                    _ => {}
-                }
-            }
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-
-    let _ = event_tx.send(SessionEvent::Close(
-        "User requested disconnect".to_string(),
-    ));
-}
-
-fn read_stdin_crossterm_rlogin(event_tx: tokio::sync::mpsc::UnboundedSender<RloginSessionEvent>) {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-    use std::time::Duration;
-
-    loop {
-        if !event::poll(Duration::from_millis(100)).unwrap_or(false) {
-            continue;
-        }
-
-        match event::read() {
-            Ok(Event::Key(key_event)) if key_event.kind == KeyEventKind::Press => {
-                let alt = key_event.modifiers.contains(KeyModifiers::ALT);
-
-                if alt && key_event.code == KeyCode::Char('.') {
-                    let _ = event_tx.send(RloginSessionEvent::Close(
-                        "User requested disconnect".to_string(),
-                    ));
-                    return;
-                }
-
-                match key_event.code {
-                    KeyCode::Char(c) => {
-                        let _ = event_tx.send(RloginSessionEvent::SendData(vec![c as u8]));
-                    }
-                    KeyCode::Enter => {
+                    if vkey == 0x0D || ch == b'\r' as u16 {
                         let _ = event_tx.send(RloginSessionEvent::SendData(vec![b'\r']));
-                    }
-                    KeyCode::Backspace => {
+                    } else if vkey == 0x08 {
                         let _ = event_tx.send(RloginSessionEvent::SendData(vec![0x7f]));
-                    }
-                    KeyCode::Tab => {
+                    } else if vkey == 0x09 {
                         let _ = event_tx.send(RloginSessionEvent::SendData(vec![b'\t']));
-                    }
-                    KeyCode::Esc => {
+                    } else if vkey == 0x1B {
                         let _ = event_tx.send(RloginSessionEvent::SendData(vec![0x1b]));
+                    } else if ctrl && ch >= 1 && ch <= 26 {
+                        let _ = event_tx.send(RloginSessionEvent::SendData(vec![ch as u8]));
+                    } else if ch > 0 && ch < 0x7F {
+                        let _ = event_tx.send(RloginSessionEvent::SendData(vec![ch as u8]));
                     }
-                    KeyCode::Up => {
-                        let _ = event_tx.send(RloginSessionEvent::SendData(b"\x1b[A".to_vec()));
-                    }
-                    KeyCode::Down => {
-                        let _ = event_tx.send(RloginSessionEvent::SendData(b"\x1b[B".to_vec()));
-                    }
-                    KeyCode::Right => {
-                        let _ = event_tx.send(RloginSessionEvent::SendData(b"\x1b[C".to_vec()));
-                    }
-                    KeyCode::Left => {
-                        let _ = event_tx.send(RloginSessionEvent::SendData(b"\x1b[D".to_vec()));
-                    }
-                    KeyCode::Home => {
-                        let _ = event_tx.send(RloginSessionEvent::SendData(b"\x1b[H".to_vec()));
-                    }
-                    KeyCode::End => {
-                        let _ = event_tx.send(RloginSessionEvent::SendData(b"\x1b[F".to_vec()));
-                    }
-                    _ => {}
                 }
             }
-            Ok(_) => {}
-            Err(_) => break,
         }
     }
-
-    let _ = event_tx.send(RloginSessionEvent::Close(
-        "User requested disconnect".to_string(),
-    ));
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::io::Read;
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        let mut buf = [0u8; 256];
+        loop {
+            match handle.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let data = buf[..n].to_vec();
+                    if data.len() >= 2 && data[0] == b'~' && data[1] == b'.' {
+                        let _ = event_tx.send(RloginSessionEvent::Close("disconnect".to_string()));
+                        return;
+                    }
+                    let _ = event_tx.send(RloginSessionEvent::SendData(data));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = event_tx.send(RloginSessionEvent::Close("stdin ended".to_string()));
 }
