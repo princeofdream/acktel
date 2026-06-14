@@ -21,17 +21,27 @@ pub struct ConnectResult {
 }
 
 pub struct ConnectionInner {
-    read_half: Option<OwnedReadHalf>,
-    write_half: Option<OwnedWriteHalf>,
     state: ConnectionState,
 }
 
-#[derive(Clone)]
 pub struct Connection {
     inner: Arc<Mutex<ConnectionInner>>,
+    writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     error_tx: tokio::sync::mpsc::UnboundedSender<String>,
     close_tx: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl Clone for Connection {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            writer: self.writer.clone(),
+            data_tx: self.data_tx.clone(),
+            error_tx: self.error_tx.clone(),
+            close_tx: self.close_tx.clone(),
+        }
+    }
 }
 
 impl Connection {
@@ -42,10 +52,9 @@ impl Connection {
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ConnectionInner {
-                read_half: None,
-                write_half: None,
                 state: ConnectionState::Disconnected,
             })),
+            writer: Arc::new(Mutex::new(None)),
             data_tx,
             error_tx,
             close_tx,
@@ -68,10 +77,24 @@ impl Connection {
                 let _ = stream.set_nodelay(true);
                 let (read_half, write_half) = stream.into_split();
 
-                let mut inner = self.inner.lock().await;
-                inner.read_half = Some(read_half);
-                inner.write_half = Some(write_half);
-                inner.state = ConnectionState::Connected;
+                {
+                    let mut inner = self.inner.lock().await;
+                    inner.state = ConnectionState::Connected;
+                }
+                {
+                    let mut w = self.writer.lock().await;
+                    *w = Some(write_half);
+                }
+
+                // Start read task immediately with the read_half
+                let data_tx = self.data_tx.clone();
+                let error_tx = self.error_tx.clone();
+                let close_tx = self.close_tx.clone();
+                let inner = self.inner.clone();
+
+                tokio::spawn(async move {
+                    Self::read_loop(read_half, data_tx, error_tx, close_tx, inner).await;
+                });
 
                 log::info!("Connected to {}:{}", hostname, port);
                 ConnectResult { success: true, error_message: String::new() }
@@ -93,16 +116,67 @@ impl Connection {
         }
     }
 
-    pub async fn disconnect(&self) {
-        let mut inner = self.inner.lock().await;
-        if inner.state == ConnectionState::Disconnected {
-            return;
+    async fn read_loop(
+        mut reader: OwnedReadHalf,
+        data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        error_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        close_tx: tokio::sync::mpsc::UnboundedSender<()>,
+        inner: Arc<Mutex<ConnectionInner>>,
+    ) {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => {
+                    log::info!("Connection closed by remote");
+                    {
+                        let mut i = inner.lock().await;
+                        i.state = ConnectionState::Disconnected;
+                    }
+                    let _ = close_tx.send(());
+                    break;
+                }
+                Ok(n) => {
+                    let data = buf[..n].to_vec();
+                    log::debug!("Connection read: {} bytes", n);
+                    let _ = data_tx.send(data);
+                }
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::ConnectionReset
+                        && e.kind() != std::io::ErrorKind::UnexpectedEof
+                    {
+                        log::error!("Read error: {}", e);
+                        let _ = error_tx.send(e.to_string());
+                    } else {
+                        log::info!("Connection closed by remote");
+                    }
+                    {
+                        let mut i = inner.lock().await;
+                        i.state = ConnectionState::Disconnected;
+                    }
+                    let _ = close_tx.send(());
+                    break;
+                }
+            }
         }
-        inner.state = ConnectionState::Closing;
-        log::info!("Disconnecting");
-        inner.read_half = None;
-        inner.write_half = None;
-        inner.state = ConnectionState::Disconnected;
+    }
+
+    pub async fn disconnect(&self) {
+        {
+            let mut inner = self.inner.lock().await;
+            if inner.state == ConnectionState::Disconnected {
+                return;
+            }
+            inner.state = ConnectionState::Closing;
+            log::info!("Disconnecting");
+        }
+        {
+            let mut w = self.writer.lock().await;
+            *w = None;
+        }
+        {
+            let mut inner = self.inner.lock().await;
+            inner.state = ConnectionState::Disconnected;
+        }
     }
 
     pub async fn is_connected(&self) -> bool {
@@ -116,11 +190,14 @@ impl Connection {
     }
 
     pub async fn send(&self, data: &[u8]) -> bool {
-        let mut inner = self.inner.lock().await;
+        let inner = self.inner.lock().await;
         if inner.state != ConnectionState::Connected {
             return false;
         }
-        if let Some(ref mut writer) = inner.write_half {
+        drop(inner);
+
+        let mut w = self.writer.lock().await;
+        if let Some(ref mut writer) = *w {
             match writer.write_all(data).await {
                 Ok(()) => true,
                 Err(e) => {
@@ -130,53 +207,6 @@ impl Connection {
             }
         } else {
             false
-        }
-    }
-
-    pub async fn start_read(self) {
-        let mut buf = vec![0u8; 4096];
-        loop {
-            let read_result = {
-                let mut inner = self.inner.lock().await;
-                if let Some(ref mut reader) = inner.read_half {
-                    Some(reader.read(&mut buf).await)
-                } else {
-                    None
-                }
-            };
-
-            match read_result {
-                Some(Ok(0)) => {
-                    log::info!("Connection closed by remote");
-                    {
-                        let mut inner = self.inner.lock().await;
-                        inner.state = ConnectionState::Disconnected;
-                    }
-                    let _ = self.close_tx.send(());
-                    break;
-                }
-                Some(Ok(n)) => {
-                    let data = buf[..n].to_vec();
-                    let _ = self.data_tx.send(data);
-                }
-                Some(Err(e)) => {
-                    if e.kind() != std::io::ErrorKind::ConnectionReset
-                        && e.kind() != std::io::ErrorKind::UnexpectedEof
-                    {
-                        log::error!("Read error: {}", e);
-                        let _ = self.error_tx.send(e.to_string());
-                    } else {
-                        log::info!("Connection closed by remote");
-                    }
-                    {
-                        let mut inner = self.inner.lock().await;
-                        inner.state = ConnectionState::Disconnected;
-                    }
-                    let _ = self.close_tx.send(());
-                    break;
-                }
-                None => break,
-            }
         }
     }
 }

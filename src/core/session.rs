@@ -103,13 +103,13 @@ impl Session {
         self.parser.set_callback(move |event: ParseEvent| {
             match event.event_type {
                 EventType::Data => {
-                    // Clean data, no IAC bytes - display it
+                    log::debug!("Parser Data: {} bytes", event.data.len());
                     if !event.data.is_empty() {
                         let _ = event_tx.send(SessionEvent::DisplayData(event.data));
                     }
                 }
                 EventType::Send => {
-                    // Protocol response to send to server
+                    log::debug!("Parser Send: {} bytes", event.data.len());
                     if !event.data.is_empty() {
                         let _ = event_tx.send(SessionEvent::SendData(event.data));
                     }
@@ -211,30 +211,25 @@ impl Session {
 
         self.active = true;
 
-        // Send initial negotiation
+        // Send initial negotiation: WILL TTYPE, WILL NAWS, DO SGA, DO ECHO
         self.parser.send_will(TELOPT_TTYPE);
         self.parser.send_will(TELOPT_NAWS);
         self.parser.send_do(TELOPT_SGA);
         self.parser.send_do(TELOPT_ECHO);
 
-        // Send initial NAWS
-        self.subneg.send_naws();
+        // Proactively send NAWS window size (like telcli does)
+        // Some servers require this before sending the login prompt
+        self.parser.send_subnegotiation(TELOPT_NAWS, &[0, 80, 0, 24]);
 
         // Start read task
-        let read_conn = conn.clone();
-        tokio::spawn(async move {
-            read_conn.start_read().await;
-        });
-
         self.connection = Some(conn);
 
-        // Spawn data forwarding task
+        // Spawn data forwarding task - routes raw bytes from connection to parser
         let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     Some(data) = data_rx.recv() => {
-                        // Raw bytes from connection - send as RawData for parser processing
                         let _ = event_tx.send(SessionEvent::RawData(data));
                     }
                     Some(err) = error_rx.recv() => {
@@ -287,6 +282,7 @@ impl Session {
     pub fn handle_event(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::DisplayData(data) => {
+                log::debug!("DisplayData: {} bytes", data.len());
                 // Clean data from parser, display it
                 let response = self.prompt_detector.detect_and_respond(&data);
                 if !response.is_empty() {
@@ -294,14 +290,13 @@ impl Session {
                 }
             }
             SessionEvent::RawData(data) => {
+                log::debug!("RawData: {} bytes, first={:02x}", data.len(), data.first().unwrap_or(&0));
                 // Raw bytes from connection - process through parser
-                // Parser will emit DisplayData and SendData events via callback
                 self.parser.process(&data);
             }
             SessionEvent::SendData(data) => {
-                // Send data to server
-                if let Some(ref conn) = self.connection {
-                    let conn = conn.clone();
+                log::debug!("SendData: {} bytes", data.len());
+                if let Some(conn) = self.connection.clone() {
                     tokio::spawn(async move {
                         conn.send(&data).await;
                     });

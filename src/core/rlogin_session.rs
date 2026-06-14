@@ -93,12 +93,6 @@ impl RloginSession {
 
         log::info!("Rlogin handshake sent to {}:{}", config.hostname, config.port);
 
-        // Start read task
-        let read_conn = conn.clone();
-        tokio::spawn(async move {
-            read_conn.start_read().await;
-        });
-
         self.connection = Some(conn);
 
         // Spawn data forwarding task
@@ -137,8 +131,7 @@ impl RloginSession {
         if !self.active {
             return;
         }
-        if let Some(ref conn) = self.connection {
-            let conn = conn.clone();
+        if let Some(conn) = self.connection.clone() {
             let data = data.to_vec();
             tokio::spawn(async move {
                 conn.send(&data).await;
@@ -167,18 +160,16 @@ impl RloginSession {
                 self.parser.process(&data);
             }
             RloginSessionEvent::SendData(data) => {
-                if let Some(ref conn) = self.connection {
-                    let conn = conn.clone();
-                    tokio::spawn(async move {
-                        conn.send(&data).await;
-                    });
-                }
+        if let Some(conn) = self.connection.clone() {
+            tokio::spawn(async move {
+                conn.send(&data).await;
+            });
+        }
             }
             RloginSessionEvent::WindowResize => {
                 let ws = terminal.get_window_size();
                 let resize_data = RloginParser::build_window_resize(ws.height, ws.width);
-                if let Some(ref conn) = self.connection {
-                    let conn = conn.clone();
+                if let Some(conn) = self.connection.clone() {
                     tokio::spawn(async move {
                         conn.send(&resize_data).await;
                     });
