@@ -70,6 +70,7 @@ pub struct Parser {
     sb_option: u8,
     sb_data: Vec<u8>,
     send_buf: Vec<u8>,
+    data_buf: Vec<u8>,
     callback: Option<Box<dyn Fn(ParseEvent) + Send + Sync>>,
 }
 
@@ -81,6 +82,7 @@ impl Parser {
             sb_option: 0,
             sb_data: Vec::new(),
             send_buf: Vec::new(),
+            data_buf: Vec::new(),
             callback: None,
         }
     }
@@ -95,14 +97,24 @@ impl Parser {
         }
     }
 
+    /// Flush accumulated data bytes as a single event
+    fn flush_data(&mut self) {
+        if !self.data_buf.is_empty() {
+            let data = std::mem::take(&mut self.data_buf);
+            self.emit(ParseEvent::data(data));
+        }
+    }
+
     pub fn process(&mut self, data: &[u8]) {
         for &byte in data {
             match self.state {
                 ParserState::Data => {
                     if byte == IAC {
+                        // Flush accumulated data before processing IAC
+                        self.flush_data();
                         self.state = ParserState::Iac;
                     } else {
-                        self.emit(ParseEvent::data(vec![byte]));
+                        self.data_buf.push(byte);
                     }
                 }
                 ParserState::Iac => {
@@ -118,14 +130,16 @@ impl Parser {
                         }
                         IAC => {
                             // Escaped IAC - literal 0xFF
-                            self.emit(ParseEvent::data(vec![IAC]));
+                            self.data_buf.push(IAC);
                             self.state = ParserState::Data;
                         }
                         GA | EL | EC | AYT | AO | IP | BRK | DM | NOP => {
+                            self.flush_data();
                             self.emit(ParseEvent::iac(byte));
                             self.state = ParserState::Data;
                         }
                         _ => {
+                            self.flush_data();
                             self.emit(ParseEvent::error(&format!("Unknown IAC command: {}", byte)));
                             self.state = ParserState::Data;
                         }
@@ -133,21 +147,25 @@ impl Parser {
                 }
                 ParserState::Will => {
                     self.current_option = byte;
+                    self.flush_data();
                     self.emit(ParseEvent::will(byte));
                     self.state = ParserState::Data;
                 }
                 ParserState::Wont => {
                     self.current_option = byte;
+                    self.flush_data();
                     self.emit(ParseEvent::wont(byte));
                     self.state = ParserState::Data;
                 }
                 ParserState::Do => {
                     self.current_option = byte;
+                    self.flush_data();
                     self.emit(ParseEvent::do_cmd(byte));
                     self.state = ParserState::Data;
                 }
                 ParserState::Dont => {
                     self.current_option = byte;
+                    self.flush_data();
                     self.emit(ParseEvent::dont(byte));
                     self.state = ParserState::Data;
                 }
@@ -165,6 +183,7 @@ impl Parser {
                 ParserState::SbIac => {
                     if byte == SE {
                         // End of subnegotiation
+                        self.flush_data();
                         let opt = self.sb_option;
                         let data = std::mem::take(&mut self.sb_data);
                         self.emit(ParseEvent::subnegotiation(opt, data));
@@ -174,7 +193,8 @@ impl Parser {
                         self.sb_data.push(IAC);
                         self.state = ParserState::SbData;
                     } else {
-                        // Protocol error - unexpected byte after IAC in subneg
+                        // Protocol error
+                        self.flush_data();
                         self.emit(ParseEvent::error(&format!(
                             "Unexpected byte {} after IAC in subnegotiation", byte
                         )));
@@ -183,6 +203,8 @@ impl Parser {
                 }
             }
         }
+        // Flush any remaining data at end of chunk
+        self.flush_data();
     }
 
     pub fn send_data(&mut self, data: &[u8]) {
