@@ -5,7 +5,7 @@ use clap::Parser;
 use acktel::cli::args::{Args, DisplayModeArg, Protocol};
 use acktel::cli::config::Config;
 use acktel::core::shutdown::ShutdownManager;
-use acktel::terminal::terminal::{DisplayMode, create_terminal, write_with_mode};
+use acktel::terminal::terminal::{DisplayMode, write_with_mode};
 
 use acktel::core::session::SessionEvent;
 use acktel::core::rlogin_session::RloginSessionEvent;
@@ -62,8 +62,8 @@ fn main() {
     let passwd_prompts = args.passwd_prompt.clone();
     let timeout = args.timeout;
 
-    let mut terminal = create_terminal();
-    terminal.set_raw_mode(true);
+    // Enable crossterm raw mode for proper key event detection
+    crossterm::terminal::enable_raw_mode().expect("Failed to enable raw mode");
 
     let mut shutdown = ShutdownManager::new();
     shutdown.install_signal_handlers();
@@ -73,7 +73,7 @@ fn main() {
             run_telnet(
                 &hostname, port, timeout, &terminal_type, display_mode,
                 &username, &password, &user_prompts, &passwd_prompts,
-                &mut shutdown, terminal.as_mut(),
+                &mut shutdown,
             );
         }
         Protocol::Rlogin => {
@@ -84,12 +84,13 @@ fn main() {
             run_rlogin(
                 &hostname, port, timeout, &terminal_type, display_mode,
                 &local_user, &username, &password, &user_prompts, &passwd_prompts,
-                &mut shutdown, terminal.as_mut(),
+                &mut shutdown,
             );
         }
     }
 
-    terminal.set_raw_mode(false);
+    // Restore terminal
+    let _ = crossterm::terminal::disable_raw_mode();
     println!("\r\nDisconnected");
 }
 
@@ -104,7 +105,6 @@ fn run_telnet(
     user_prompts: &[String],
     passwd_prompts: &[String],
     shutdown: &mut ShutdownManager,
-    _terminal: &mut dyn acktel::terminal::terminal::Terminal,
 ) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -175,7 +175,6 @@ fn run_rlogin(
     user_prompts: &[String],
     passwd_prompts: &[String],
     shutdown: &mut ShutdownManager,
-    terminal: &mut dyn acktel::terminal::terminal::Terminal,
 ) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -233,7 +232,7 @@ fn run_rlogin(
                 }
                 _ => {}
             }
-            session.handle_event(event, terminal);
+            session.handle_event(event);
             if !session.is_active() {
                 break;
             }

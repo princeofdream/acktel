@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use crate::auth::prompt_detector::PromptDetector;
 use crate::net::connection::Connection;
 use crate::protocol::rlogin::{RloginConfig, RloginParser};
-use crate::terminal::terminal::{DisplayMode, Terminal};
+use crate::terminal::terminal::DisplayMode;
 
 pub struct RloginSessionConfig {
     pub hostname: String,
@@ -154,27 +154,27 @@ impl RloginSession {
         self.display_mode
     }
 
-    pub fn handle_event(&mut self, event: RloginSessionEvent, terminal: &dyn Terminal) {
+    pub fn handle_event(&mut self, event: RloginSessionEvent) {
         match event {
             RloginSessionEvent::ServerData(data) => {
                 self.parser.process(&data);
             }
             RloginSessionEvent::SendData(data) => {
-        if let Some(conn) = self.connection.clone() {
-            tokio::spawn(async move {
-                conn.send(&data).await;
-            });
-        }
+                if let Some(conn) = self.connection.clone() {
+                    tokio::spawn(async move {
+                        conn.send(&data).await;
+                    });
+                }
             }
             RloginSessionEvent::WindowResize => {
-                let ws = terminal.get_window_size();
-                let resize_data = RloginParser::build_window_resize(ws.height, ws.width);
+                // Use default 80x24 for resize notification
+                let resize_data = RloginParser::build_window_resize(24, 80);
                 if let Some(conn) = self.connection.clone() {
                     tokio::spawn(async move {
                         conn.send(&resize_data).await;
                     });
                 }
-                log::debug!("Rlogin window resize sent: {}x{}", ws.width, ws.height);
+                log::debug!("Rlogin window resize sent");
             }
             RloginSessionEvent::Close(reason) => {
                 self.stop(&reason);
