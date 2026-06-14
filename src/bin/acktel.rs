@@ -70,9 +70,18 @@ fn main() {
 
     match args.protocol {
         Protocol::Telnet => {
+            // For telnet: username from -u, fallback to -l (local_user)
+            let telnet_user = if !username.is_empty() {
+                username.clone()
+            } else if !args.local_user.as_deref().unwrap_or("").is_empty() {
+                args.local_user.clone().unwrap_or_default()
+            } else {
+                username.clone()
+            };
+
             run_telnet(
                 &hostname, port, timeout, &terminal_type, display_mode,
-                &username, &password, &user_prompts, &passwd_prompts,
+                &telnet_user, &password, &user_prompts, &passwd_prompts,
                 &mut shutdown,
             );
         }
