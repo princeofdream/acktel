@@ -148,7 +148,7 @@ fn run_telnet(
         // Main event loop
         while let Some(event) = event_rx.recv().await {
             match &event {
-                SessionEvent::ServerData(data) => {
+                SessionEvent::DisplayData(data) => {
                     let mode = session.display_mode();
                     write_with_mode(&mut std::io::stdout(), data, mode);
                     std::io::stdout().flush().ok();

@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use crate::auth::prompt_detector::PromptDetector;
 use crate::net::connection::Connection;
 use crate::protocol::constants::*;
-use crate::protocol::parser::{Parser, ParseEvent};
+use crate::protocol::parser::{Parser, ParseEvent, EventType};
 use crate::protocol::subneg::Subneg;
 use crate::terminal::terminal::DisplayMode;
 
@@ -21,7 +21,11 @@ pub struct SessionConfig {
 }
 
 pub enum SessionEvent {
-    ServerData(Vec<u8>),
+    /// Parsed data ready to display (IAC bytes stripped)
+    DisplayData(Vec<u8>),
+    /// Raw bytes from connection - needs parsing
+    RawData(Vec<u8>),
+    /// Send raw bytes to server
     SendData(Vec<u8>),
     WindowResize,
     Close(String),
@@ -32,10 +36,7 @@ pub struct Session {
     parser: Parser,
     subneg: Subneg,
     prompt_detector: PromptDetector,
-    terminal_type: String,
     display_mode: DisplayMode,
-    username: String,
-    password: String,
     active: bool,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
     event_rx: Option<mpsc::UnboundedReceiver<SessionEvent>>,
@@ -50,10 +51,7 @@ impl Session {
             parser: Parser::new(),
             subneg: Subneg::new(),
             prompt_detector: PromptDetector::new(),
-            terminal_type: "xterm-256color".to_string(),
             display_mode: DisplayMode::Raw,
-            username: String::new(),
-            password: String::new(),
             active: false,
             event_tx,
             event_rx: Some(event_rx),
@@ -70,9 +68,6 @@ impl Session {
 
     pub async fn start(&mut self, config: SessionConfig) -> bool {
         self.display_mode = config.display_mode;
-        self.username = config.username.clone();
-        self.password = config.password.clone();
-        self.terminal_type = config.terminal_type.clone();
 
         self.prompt_detector.set_username(&config.username);
         self.prompt_detector.set_password(&config.password);
@@ -103,23 +98,111 @@ impl Session {
             let _ = event_tx.send(SessionEvent::SendData(vec![IAC, WONT, TELOPT_AUTHENTICATION]));
         });
 
-        // Set up parser callbacks - parser processes raw bytes and emits events
+        // Set up parser callback - processes IAC sequences, emits clean data
         let event_tx = self.event_tx.clone();
         self.parser.set_callback(move |event: ParseEvent| {
-            // For now, just forward the raw data
-            if !event.data.is_empty() {
-                let _ = event_tx.send(SessionEvent::ServerData(event.data));
+            match event.event_type {
+                EventType::Data => {
+                    // Clean data, no IAC bytes - display it
+                    if !event.data.is_empty() {
+                        let _ = event_tx.send(SessionEvent::DisplayData(event.data));
+                    }
+                }
+                EventType::Send => {
+                    // Protocol response to send to server
+                    if !event.data.is_empty() {
+                        let _ = event_tx.send(SessionEvent::SendData(event.data));
+                    }
+                }
+                EventType::Will => {
+                    log::debug!("Server WILL {}", event.option);
+                    // For supported options, respond DO; otherwise DONT
+                    match event.option {
+                        TELOPT_TTYPE | TELOPT_NAWS | TELOPT_SGA | TELOPT_ECHO | TELOPT_BINARY => {
+                            let _ = event_tx.send(SessionEvent::SendData(vec![IAC, DO, event.option]));
+                        }
+                        _ => {
+                            let _ = event_tx.send(SessionEvent::SendData(vec![IAC, DONT, event.option]));
+                        }
+                    }
+                }
+                EventType::Wont => {
+                    log::debug!("Server WONT {}", event.option);
+                    let _ = event_tx.send(SessionEvent::SendData(vec![IAC, DONT, event.option]));
+                }
+                EventType::Do => {
+                    log::debug!("Server DO {}", event.option);
+                    match event.option {
+                        TELOPT_TTYPE => {
+                            let _ = event_tx.send(SessionEvent::SendData(vec![IAC, WILL, TELOPT_TTYPE]));
+                        }
+                        TELOPT_NAWS => {
+                            let _ = event_tx.send(SessionEvent::SendData(vec![IAC, WILL, TELOPT_NAWS]));
+                            // Send initial NAWS 80x24
+                            let naws = vec![IAC, SB, TELOPT_NAWS, 0, 80, 0, 24, IAC, SE];
+                            let _ = event_tx.send(SessionEvent::SendData(naws));
+                        }
+                        TELOPT_SGA => {
+                            let _ = event_tx.send(SessionEvent::SendData(vec![IAC, WILL, TELOPT_SGA]));
+                        }
+                        TELOPT_ECHO => {
+                            let _ = event_tx.send(SessionEvent::SendData(vec![IAC, WILL, TELOPT_ECHO]));
+                        }
+                        TELOPT_BINARY => {
+                            let _ = event_tx.send(SessionEvent::SendData(vec![IAC, WILL, TELOPT_BINARY]));
+                        }
+                        _ => {
+                            let _ = event_tx.send(SessionEvent::SendData(vec![IAC, WONT, event.option]));
+                        }
+                    }
+                }
+                EventType::Dont => {
+                    log::debug!("Server DONT {}", event.option);
+                    let _ = event_tx.send(SessionEvent::SendData(vec![IAC, WONT, event.option]));
+                }
+                EventType::Subnegotiation => {
+                    log::debug!("Subneg option={} len={}", event.option, event.data.len());
+                    match event.option {
+                        TELOPT_TTYPE => {
+                            if !event.data.is_empty() && event.data[0] == TTYPE_SEND {
+                                let ttype = "xterm-256color";
+                                let mut resp = vec![IAC, SB, TELOPT_TTYPE, TTYPE_IS];
+                                resp.extend_from_slice(ttype.as_bytes());
+                                resp.extend_from_slice(&[IAC, SE]);
+                                let _ = event_tx.send(SessionEvent::SendData(resp));
+                            }
+                        }
+                        TELOPT_NAWS => {
+                            if event.data.len() >= 4 {
+                                let w = ((event.data[0] as u16) << 8) | event.data[1] as u16;
+                                let h = ((event.data[2] as u16) << 8) | event.data[3] as u16;
+                                log::info!("Server NAWS: {}x{}", w, h);
+                            }
+                        }
+                        TELOPT_AUTHENTICATION => {
+                            if !event.data.is_empty() && event.data[0] == AUTH_SEND {
+                                let _ = event_tx.send(SessionEvent::SendData(vec![IAC, WONT, TELOPT_AUTHENTICATION]));
+                            }
+                        }
+                        _ => {
+                            log::debug!("Unhandled subneg option: {}", event.option);
+                        }
+                    }
+                }
+                EventType::Error => {
+                    log::error!("Protocol error: {}", event.error_message);
+                }
+                _ => {}
             }
         });
 
-        // Create connection with channel plumbing
+        // Create connection
         let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (error_tx, mut error_rx) = mpsc::unbounded_channel::<String>();
         let (close_tx, mut close_rx) = mpsc::unbounded_channel::<()>();
 
         let conn = Connection::new(data_tx, error_tx, close_tx);
 
-        // Connect
         let result = conn.connect(&config.hostname, config.port, config.timeout_sec).await;
         if !result.success {
             log::error!("Failed to connect: {}", result.error_message);
@@ -151,7 +234,8 @@ impl Session {
             loop {
                 tokio::select! {
                     Some(data) = data_rx.recv() => {
-                        let _ = event_tx.send(SessionEvent::ServerData(data));
+                        // Raw bytes from connection - send as RawData for parser processing
+                        let _ = event_tx.send(SessionEvent::RawData(data));
                     }
                     Some(err) = error_rx.recv() => {
                         log::error!("Connection error: {}", err);
@@ -202,16 +286,20 @@ impl Session {
 
     pub fn handle_event(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::ServerData(data) => {
-                // Display handled by caller
-                // Auto-respond to prompts
+            SessionEvent::DisplayData(data) => {
+                // Clean data from parser, display it
                 let response = self.prompt_detector.detect_and_respond(&data);
                 if !response.is_empty() {
                     let _ = self.event_tx.send(SessionEvent::SendData(response));
                 }
             }
+            SessionEvent::RawData(data) => {
+                // Raw bytes from connection - process through parser
+                // Parser will emit DisplayData and SendData events via callback
+                self.parser.process(&data);
+            }
             SessionEvent::SendData(data) => {
-                let _event_tx = self.event_tx.clone();
+                // Send data to server
                 if let Some(ref conn) = self.connection {
                     let conn = conn.clone();
                     tokio::spawn(async move {
