@@ -62,11 +62,8 @@ fn main() {
     let passwd_prompts = args.passwd_prompt.clone();
     let timeout = args.timeout;
 
-    // Enable raw mode for proper key event detection on Windows
-    #[cfg(target_os = "windows")]
-    {
-        // On Windows, we use Console API directly - no crossterm raw mode needed
-    }
+    // Enable raw mode for proper key event detection on non-Windows platforms
+    // On Windows, read_stdin_platform uses Console API (ReadConsoleInputW) directly
     #[cfg(not(target_os = "windows"))]
     {
         crossterm::terminal::enable_raw_mode().expect("Failed to enable raw mode");
@@ -186,32 +183,118 @@ fn run_telnet(
 fn read_stdin_platform(event_tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>) {
     #[cfg(target_os = "windows")]
     {
-        use std::io::Read;
-        log::debug!("stdin thread started (Windows)");
-        let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
-        let mut buf = [0u8; 256];
+        use windows::Win32::System::Console::*;
 
-        loop {
-            match handle.read(&mut buf) {
-                Ok(0) => {
-                    log::debug!("stdin EOF");
+        unsafe {
+            let h_stdin = GetStdHandle(STD_INPUT_HANDLE).unwrap_or_default();
+            let mut escape_buf: Vec<u8> = Vec::new();
+
+            log::debug!("stdin thread started (Windows Console API)");
+
+            loop {
+                let mut ir: [INPUT_RECORD; 128] = std::mem::zeroed();
+                let mut count = 0u32;
+                if ReadConsoleInputW(h_stdin, &mut ir, &mut count).is_err() {
+                    log::error!("ReadConsoleInputW failed");
                     break;
                 }
-                Ok(n) => {
-                    let data = buf[..n].to_vec();
-                    log::debug!("stdin read {} bytes: {:?}", n, &data[..n.min(8)]);
 
-                    if data.len() >= 2 && data[0] == b'~' && data[1] == b'.' {
-                        let _ = event_tx.send(SessionEvent::Close("disconnect".to_string()));
-                        return;
+                for i in 0..count as usize {
+                    let record = &ir[i];
+
+                    match record.EventType {
+                        // KEY_EVENT
+                        1 => {
+                            let ke = &record.Event.KeyEvent;
+                            if !ke.bKeyDown.as_bool() { continue; }
+
+                            let dw = ke.dwControlKeyState;
+                            let ctrl = (dw & 0x0008) != 0 || (dw & 0x0004) != 0;
+                            let alt = (dw & 0x0002) != 0 || (dw & 0x0001) != 0;
+                            let ch = ke.uChar.UnicodeChar;
+                            let vkey = ke.wVirtualKeyCode;
+
+                            // Alt+. → disconnect
+                            if alt && ch == '.' as u16 {
+                                let _ = event_tx.send(SessionEvent::Close("disconnect".to_string()));
+                                return;
+                            }
+
+                            // Ctrl+C → send 0x03 to server (don't exit)
+                            if ctrl && (ch == 0x03 || vkey == 0x43) {
+                                escape_buf.clear();
+                                let _ = event_tx.send(SessionEvent::SendData(vec![0x03]));
+                                continue;
+                            }
+
+                            // Ctrl+D → send 0x04 to server
+                            if ctrl && (ch == 0x04 || vkey == 0x44) {
+                                escape_buf.clear();
+                                let _ = event_tx.send(SessionEvent::SendData(vec![0x04]));
+                                continue;
+                            }
+
+                            // Ctrl+Z → send 0x1A to server
+                            if ctrl && (ch == 0x1A || vkey == 0x5A) {
+                                escape_buf.clear();
+                                let _ = event_tx.send(SessionEvent::SendData(vec![0x1A]));
+                                continue;
+                            }
+
+                            // Escape sequence handling (arrow keys, function keys, etc.)
+                            if vkey == 0x1B {
+                                escape_buf.clear();
+                                escape_buf.push(0x1B);
+                                continue;
+                            }
+
+                            // If we're building an escape sequence
+                            if !escape_buf.is_empty() {
+                                escape_buf.push(ch as u8);
+                                // Common final bytes for escape sequences
+                                let final_bytes = [
+                                    'A', 'B', 'C', 'D', 'H', 'F', 'Z',
+                                    '~', 'P', 'Q', 'R', 'S',
+                                ];
+                                if ch > 0 && final_bytes.contains(&(ch as u8 as char)) {
+                                    let seq = escape_buf.clone();
+                                    escape_buf.clear();
+                                    let _ = event_tx.send(SessionEvent::SendData(seq));
+                                }
+                                continue;
+                            }
+
+                            // Enter
+                            if vkey == 0x0D || ch == b'\r' as u16 {
+                                let _ = event_tx.send(SessionEvent::SendData(vec![b'\r']));
+                            }
+                            // Backspace
+                            else if vkey == 0x08 {
+                                let _ = event_tx.send(SessionEvent::SendData(vec![0x7f]));
+                            }
+                            // Tab
+                            else if vkey == 0x09 {
+                                let _ = event_tx.send(SessionEvent::SendData(vec![b'\t']));
+                            }
+                            // Other control characters (Ctrl+A through Ctrl+Z)
+                            else if ctrl && ch >= 1 && ch <= 26 {
+                                let _ = event_tx.send(SessionEvent::SendData(vec![ch as u8]));
+                            }
+                            // Printable characters
+                            else if ch > 0 && ch < 0x7F {
+                                let _ = event_tx.send(SessionEvent::SendData(vec![ch as u8]));
+                            }
+                            // Unicode characters (CJK, emoji, etc.)
+                            else if ch >= 0x7F {
+                                let s = String::from_utf16_lossy(&[ch]);
+                                let _ = event_tx.send(SessionEvent::SendData(s.into_bytes()));
+                            }
+                        }
+                        // WINDOW_BUFFER_SIZE_EVENT → ignore
+                        4 => {}
+                        // Other events → ignore
+                        _ => {}
                     }
-
-                    let _ = event_tx.send(SessionEvent::SendData(data));
-                }
-                Err(e) => {
-                    log::error!("stdin read error: {}", e);
-                    break;
                 }
             }
         }
