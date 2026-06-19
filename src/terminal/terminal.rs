@@ -190,7 +190,7 @@ mod platform {
 #[cfg(not(target_os = "windows"))]
 mod platform {
     use super::*;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd};
 
     pub struct UnixTerminal {
         orig_termios: Option<nix::sys::termios::Termios>,
@@ -207,42 +207,40 @@ mod platform {
 
     impl Terminal for UnixTerminal {
         fn set_raw_mode(&mut self, enable: bool) -> bool {
-            unsafe {
-                let fd = std::io::stdin().as_raw_fd();
-                if enable {
-                    match nix::sys::termios::tcgetattr(fd) {
-                        Ok(mut term) => {
-                            self.orig_termios = Some(term.clone());
-                            term.local_flags &= !(nix::sys::termios::LocalFlags::ECHO
-                                | nix::sys::termios::LocalFlags::ICANON
-                                | nix::sys::termios::LocalFlags::ISIG);
-                            nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, &term).is_ok()
-                        }
-                        Err(_) => false,
+            let stdin = std::io::stdin();
+            let fd = stdin.as_fd();
+            if enable {
+                match nix::sys::termios::tcgetattr(fd) {
+                    Ok(mut term) => {
+                        self.orig_termios = Some(term.clone());
+                        term.local_flags &= !(nix::sys::termios::LocalFlags::ECHO
+                            | nix::sys::termios::LocalFlags::ICANON
+                            | nix::sys::termios::LocalFlags::ISIG);
+                        nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, &term).is_ok()
                     }
+                    Err(_) => false,
+                }
+            } else {
+                if let Some(ref orig) = self.orig_termios {
+                    nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, orig).is_ok()
                 } else {
-                    if let Some(ref orig) = self.orig_termios {
-                        nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, orig).is_ok()
-                    } else {
-                        true
-                    }
+                    true
                 }
             }
         }
 
         fn set_echo_mode(&mut self, enable: bool) -> bool {
-            unsafe {
-                let fd = std::io::stdin().as_raw_fd();
-                if let Ok(mut term) = nix::sys::termios::tcgetattr(fd) {
-                    if enable {
-                        term.local_flags |= nix::sys::termios::LocalFlags::ECHO;
-                    } else {
-                        term.local_flags &= !nix::sys::termios::LocalFlags::ECHO;
-                    }
-                    nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, &term).is_ok()
+            let stdin = std::io::stdin();
+            let fd = stdin.as_fd();
+            if let Ok(mut term) = nix::sys::termios::tcgetattr(fd) {
+                if enable {
+                    term.local_flags |= nix::sys::termios::LocalFlags::ECHO;
                 } else {
-                    false
+                    term.local_flags &= !nix::sys::termios::LocalFlags::ECHO;
                 }
+                nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, &term).is_ok()
+            } else {
+                false
             }
         }
 
