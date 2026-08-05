@@ -299,6 +299,21 @@ impl Session {
         self.display_mode
     }
 
+    /// 进入文件传输模式：请求双向 BINARY 选项（尽力而为，不阻塞等待应答）。
+    /// 传输期间的 IAC 转义由 parser 的收发路径自动处理。
+    pub fn enter_transfer_mode(&mut self) {
+        self.parser.send_will(TELOPT_BINARY);
+        self.parser.send_do(TELOPT_BINARY);
+        log::info!("Session: BINARY transfer mode requested");
+    }
+
+    /// 退出文件传输模式：撤销 BINARY 请求，恢复正常 NVT 交互。
+    pub fn exit_transfer_mode(&mut self) {
+        self.parser.send_wont(TELOPT_BINARY);
+        self.parser.send_dont(TELOPT_BINARY);
+        log::info!("Session: BINARY transfer mode exited");
+    }
+
     pub fn handle_event(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::DisplayData(data) => {

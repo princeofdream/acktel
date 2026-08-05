@@ -9,6 +9,7 @@ dependencies = [
  "clap",
  "crossterm",
  "env_logger",
+ "libc",
  "log",
  "nix",
  "serde",
