@@ -1,0 +1,19 @@
+src/core/session.rs
+  s_81ffad99fa214b::t_733a78f0a9e838 302-316
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "9b1f46a0b34d15f21fb2cd4060fc2c05096d8dff",
+  "prompts": {},
+  "sessions": {
+    "s_81ffad99fa214b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcbcc-0c68-7173-a5a8-19e2d013b645",
+        "model": "deepseek-v4-flash"
+      },
+      "human_author": "lijin <lijin@syncore.space>"
+    }
+  }
+}
