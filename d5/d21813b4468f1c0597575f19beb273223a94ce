@@ -1,0 +1,15 @@
+build-acktel.ps1
+  h_be6041f2d54981 99-106,124-232
+  h_be6041f2d54981 107-123,257-261,264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d5d21813b4468f1c0597575f19beb273223a94ce",
+  "prompts": {},
+  "humans": {
+    "h_be6041f2d54981": {
+      "author": "princeofdream <princeofdream@outlook.com>"
+    }
+  }
+}
